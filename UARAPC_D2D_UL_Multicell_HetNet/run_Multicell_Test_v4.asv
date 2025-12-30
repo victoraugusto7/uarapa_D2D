@@ -1,0 +1,317 @@
+%==========================================================================
+% run_Multicell_Test.m (v4 - eMBB Garantido + D2D Underlay)
+%==========================================================================
+clear; close all; clc;
+addpath(genpath(pwd)); % Garante acesso às subpastas
+
+
+%% 1. Parâmetros de Simulação (Cenário Real - Reuso 3)
+fprintf('Definindo parâmetros da simulação (Cenário 9 Células - Foco eMBB)...\n');
+
+% --- Topologia e Usuários ---
+params.nCUE       = 70;   % Total de CUEs (15 eMBB + 15 Comuns)
+params.nD2D       = 35;   % Total de Pares D2D (Underlay)
+params.num_cells  = 9;    % Grid 3x3 (FU-2024)
+params.nRBs       = 273*9; % 1911 PRBs (Pool Global para Reuso 3)
+params.reuse_factor = 3;
+
+params.eNBradius  = 500; 
+params.maxD2DDist = 50;  
+
+% --- Potência e Interferência ---
+params.txPowerCUE = 23;   % 23 dBm
+params.txPowerD2D = 19;   % 0-20 dBm
+params.gammaCUE   = 10; 
+params.gammaD2D   = 10; 
+params.InterfMargin_dB  = 3.0; 
+params.Max_D2D_per_PRB  = 2;    % Underlay: Até 2 D2Ds por PRB ocupado
+params.Interf_CCI_media_dBm = -110.0; 
+
+% --- PERFIL 1: CUEs eMBB (Prioridade Máxima) ---
+params.eMBB_ratio         = 0.5;     % 50% dos CUEs são eMBB
+params.eMBB_Req_Rate      = 50e6;    % 50 Mbps
+params.eMBB_Req_BER       = 1e-4;    
+params.eMBB_Req_Lat       = 50e-3;   % 50 ms
+
+% Tráfego eMBB (Ajustado para Estabilidade)
+params.eMBB_Packet_size   = 1000;    
+params.eMBB_lambda        = 40000;   % 40 Mbps de carga (para 50 Mbps de serviço)
+params.eMBB_Prop_latency  = 1e-6;    
+params.eMBB_Latency_SB    = 30e-3;   
+
+% --- PERFIL 2: D2Ds e CUEs Comuns (Best Effort / Básico) ---
+% Sem requisitos extremos de URLLC, apenas conectividade básica
+params.Common_Req_Rate    = 0.5e6;   % 500 kbps (Voz/Dados básicos)
+params.Common_Req_BER     = 1e-3;    
+params.Common_Req_Lat     = 100e-3;  % 100 ms
+
+params.Common_lambda = 400; % 400 pacotes/s (~400 kbps) - Suportável por 1 PRB
+
+% --- PARÂMETROS DAS MHAs ---
+params.maxIter    = 25;  % Iterações do Loop Externo
+params.colonySize = 20;  
+params.limit      = 5;   
+params.NLsize     = 10;  
+
+params.colonySize_PC = 20;   
+params.maxIter_PC    = 5;   % GWO Rápido
+
+%% 2. Parâmetros Físicos
+phys = struct();
+phys.freq           = 3.5e9;   
+phys.noiseDensity   = -174;  
+phys.plCell.a       = 128.1; phys.plCell.b = 37.6; 
+phys.plD2D.a        = 148;   phys.plD2D.b = 40;   
+phys.shadowStdCell  = 12;     % Reduzido levemente para estabilidade
+phys.shadowStdD2D   = 10;    
+phys.gainTx_eNB     = 14;    
+phys.gainRx_UE      = 0;     
+phys.bwRB           = 360e3; 
+params.physParams   = phys;
+tic;
+%% 3. Execução das Etapas 0, 1 e 2
+% ETAPA 0: Setup
+problem = setup_Multicell_Scenario(params);
+
+% ETAPA 1: Associação (UA)
+problem = perform_User_Association(problem, params);
+
+% ETAPA 2: Filtro de Candidatos (CPS)
+% IMPORTANTE: Garanta que filter_candidates_cps.m tenha a "Imunidade eMBB"
+V_viabilidade = filter_candidates_cps(problem, params);
+
+% Diagnóstico da Etapa 2
+aprovados_cue = sum(any(V_viabilidade(1:params.nCUE, :), 2));
+aprovados_d2d = sum(any(V_viabilidade(params.nCUE+1:end, :), 2));
+fprintf('Etapa 2: %d/%d CUEs e %d/%d D2Ds aprovados.\n', ...
+    aprovados_cue, params.nCUE, aprovados_d2d, params.nD2D);
+
+
+
+%% 5. EXECUÇÃO DA FASE 3 (JOINT RA+PC)
+fprintf('\n--- 5. EXECUÇÃO DA FASE 3 (JOINT RA+PC) ---\n');
+fprintf('Algoritmos: ABC, OABC e WOA (Comparativo)\n');
+
+algorithms = {'ABC', 'OABC', 'WOA'};
+results = struct();
+
+for algo_name = algorithms
+    name = algo_name{1};
+    fprintf('\n--- Executando %s ---\n', name);
+    rng('shuffle');
+    
+   if strcmp(name, 'ABC')
+        [bestAssign, bestOF, convFit, convObj] = RRA_ABC_Multicell(problem, V_viabilidade, params);
+    elseif strcmp(name, 'OABC')
+        [bestAssign, bestOF, convFit, convObj] = RRA_OABC_Multicell(problem, V_viabilidade, params);
+    elseif strcmp(name, 'WOA') % <--- NOVO BLOCO
+        [bestAssign, bestOF, convFit, convObj] = RRA_WOA_Multicell(problem, V_viabilidade, params);
+    end
+    
+    results.(name).bestAssign = bestAssign;
+    results.(name).bestOF = bestOF;
+    results.(name).convFit = convFit; % Salva convergência de Fitness
+    results.(name).convObj = convObj; % Salva convergência de Objetivo
+end
+toc;
+
+%% 6. RELATÓRIO DETALHADO DE QoS (TODOS OS USUÁRIOS)
+fprintf('\n=====================================================================================================\n');
+fprintf('                          RELATÓRIO FINAL DE ALOCAÇÃO E QoS                                          \n');
+fprintf('=====================================================================================================\n');
+
+for algo_name = algorithms
+    name = algo_name{1};
+    res = results.(name);
+    
+    X_best = res.bestAssign;
+    P_best = optimal_power_control(X_best, problem, params);
+    [~, R_vec, BER_vec, L_vec] = calculate_qos_metrics(X_best, P_best, problem, params);
+    
+    % --- CÁLCULO DO THROUGHPUT REAL (FÍSICO) ---
+    % Somamos as taxas de todos os usuários (R_vec) ignorando as penalidades matemáticas do Fitness
+    real_throughput_mbps = sum(R_vec) / 1e6;
+    % -------------------------------------------
+    
+    fprintf('\n>> ALGORITMO: %s \n', name);
+    fprintf('   Fitness (Otimizador):     %10.2f (Inclui penalidades matemáticas)\n', res.bestOF);
+    fprintf('   Throughput Real (Físico): %10.2f Mbps (Soma das taxas reais)\n', real_throughput_mbps);
+    
+    % --- [1] CUEs eMBB (Prioridade) ---
+    idx_eMBB = find(problem.is_eMBB_CUE);
+    count_ok = 0;
+    
+    fprintf('   [1] CUEs eMBB (Requisito: > %.0f Mbps, < %.0f ms)\n', params.eMBB_Req_Rate/1e6, params.eMBB_Req_Lat*1000);
+    fprintf('   | ID  | Taxa (Mbps) |    BER     | Lat (ms) | Pwr (dBm) | PRBs |   STATUS    |\n');
+    fprintf('   |-----|-------------|------------|----------|-----------|------|-------------|\n');
+    
+    for k = idx_eMBB'
+        val_R = R_vec(k)/1e6; val_L = L_vec(k)*1000; val_P = 10*log10(P_best(k))+30;
+        nPRB = sum(X_best(1,:) == k);
+        
+        % Critério Completo: Taxa, Latência E BER
+        ok = (R_vec(k) >= params.eMBB_Req_Rate) && ...
+             (L_vec(k) <= params.eMBB_Req_Lat) && ...
+             (BER_vec(k) <= params.eMBB_Req_BER);
+             
+        if ok
+            status='ATENDIDO'; count_ok=count_ok+1; 
+        else
+            status='FALHOU'; 
+            if R_vec(k) < params.eMBB_Req_Rate, status=[status '(Tx)']; end
+            if L_vec(k) > params.eMBB_Req_Lat,  status=[status '(Lt)']; end
+            if BER_vec(k) > params.eMBB_Req_BER, status=[status '(Be)']; end
+        end
+        
+        fprintf('   | %3d |   %7.2f   |  %1.2e  |  %5.2f   |   %5.2f   |  %3d | %-11s |\n', ...
+            k, val_R, BER_vec(k), val_L, val_P, nPRB, status);
+    end
+    fprintf('   => Sucesso eMBB: %.1f%% (%d/%d)\n', (count_ok/length(idx_eMBB))*100, count_ok, length(idx_eMBB));
+
+    % --- [2] CUEs COMUNS ---
+    idx_Common = find(~problem.is_eMBB_CUE & (1:params.nCUE)');
+    valid_common = [];
+    for k = idx_Common'
+        if problem.assoc_CUE(k) > 0 && any(V_viabilidade(k,:)), valid_common = [valid_common; k]; end
+    end
+    
+    count_active = 0;
+    if ~isempty(valid_common)
+        fprintf('\n   [2] CUEs Comuns Admitidos (Melhor Esforço)\n');
+        fprintf('   | ID  | Taxa (Mbps) |    BER     | Lat (ms) | Pwr (dBm) | PRBs |   STATUS    |\n');
+        fprintf('   |-----|-------------|------------|----------|-----------|------|-------------|\n');
+        for k = valid_common'
+            val_R = R_vec(k)/1e6; val_L = L_vec(k)*1000; val_P = 10*log10(P_best(k))+30;
+            nPRB = sum(X_best(1,:) == k);
+            
+            if nPRB > 0, status = 'ATIVO'; count_active = count_active + 1;
+            else, status = 'SEM PRB'; end
+            
+            fprintf('   | %3d |   %7.2f   |  %1.2e  |  %5.2f   |   %5.2f   |  %3d | %-11s |\n', ...
+                k, val_R, BER_vec(k), val_L, val_P, nPRB, status);
+        end
+        fprintf('   => CUEs Comuns Ativos: %d/%d admitidos\n', count_active, length(valid_common));
+    end
+
+  % --- [3] D2D PAIRS (Com Latência) ---
+    idx_D2D = (params.nCUE + 1 : params.nCUE + params.nD2D)';
+    valid_d2d = [];
+    for k = idx_D2D'
+        d_idx = k - params.nCUE;
+        if problem.assoc_D2D(d_idx) > 0 && any(V_viabilidade(k,:)), valid_d2d = [valid_d2d; k]; end
+    end
+
+    count_d2d_active = 0;
+    if ~isempty(valid_d2d)
+        fprintf('\n   [3] Pares D2D Admitidos (Underlay)\n');
+        % CABEÇALHO CORRIGIDO COM LATÊNCIA
+        fprintf('   | ID  | Taxa (Mbps) |    BER     | Lat (ms) | Pwr (dBm) | PRBs (Reuso) |   STATUS    |\n');
+        fprintf('   |-----|-------------|------------|----------|-----------|--------------|-------------|\n');
+        for k = valid_d2d'
+            val_R = R_vec(k)/1e6; 
+            val_P = 10*log10(P_best(k))+30;
+            val_L = L_vec(k)*1000; % Latência em ms
+            nPRB = sum(sum(X_best(2:3,:) == k));
+            
+            if nPRB > 0, status = 'REUSANDO'; count_d2d_active = count_d2d_active + 1;
+            else, status = 'SEM PRB'; end
+            
+            % PRINT CORRIGIDO
+            fprintf('   | %3d |   %7.2f   |  %1.2e  |  %5.2f   |   %5.2f   |      %3d     | %-11s |\n', ...
+                k, val_R, BER_vec(k), val_L, val_P, nPRB, status);
+        end
+        fprintf('   => D2Ds Ativos: %d/%d admitidos\n', count_d2d_active, length(valid_d2d));
+    end
+    fprintf('-----------------------------------------------------------------------------------------------------\n');
+end
+%% 7. VISUALIZAÇÃO FINAL (Gráficos Limpos e Corrigidos)
+fprintf('\n--- Gerando Gráficos... ---\n');
+
+% FIG 1: Topologia 9 Células (Grid Hexagonal + Usuários)
+figure(1); clf; hold on;
+title('Fig 1: Topologia 9 Células (Honeycomb) e Usuários');
+xlabel('X (m)'); ylabel('Y (m)'); axis equal; grid on;
+
+% 1. Plota Células (Sem sujar a legenda)
+R = problem.eNBradius;
+for b = 1:problem.nCells
+    % Plota o hexágono mas esconde da legenda
+    plot_hexagon(problem.pos_MBSs(b,1), problem.pos_MBSs(b,2), R);
+    % (Nota: Se plot_hexagon não aceitar argumentos extras, 
+    %  você precisará editar a função plot_hexagon. 
+    %  Alternativa rápida: limpar legendas depois).
+end
+
+% 2. Plota MBSs
+h_mbs = plot(problem.pos_MBSs(:,1), problem.pos_MBSs(:,2), 'sk', ...
+    'MarkerFaceColor','k', 'MarkerSize',8, 'DisplayName','MBS');
+
+% 3. Plota Usuários (Agrupados para Legenda Única)
+idx_e = find(problem.is_eMBB_CUE); 
+idx_c = find(~problem.is_eMBB_CUE);
+
+% CUE Comum
+if ~isempty(idx_c)
+    h_cue_c = plot(problem.pos_CUEs(idx_c,1), problem.pos_CUEs(idx_c,2), ...
+        'ob', 'MarkerSize',5, 'DisplayName','CUE Comum');
+end
+
+% CUE eMBB
+if ~isempty(idx_e)
+    h_cue_e = plot(problem.pos_CUEs(idx_e,1), problem.pos_CUEs(idx_e,2), ...
+        'p', 'MarkerSize',11, 'MarkerFaceColor','c', 'MarkerEdgeColor','b', ...
+        'DisplayName','CUE eMBB (Comandante)');
+end
+
+% 4. Plota D2Ds (Tx e Rx) - CORRIGIDO
+% Tx (Triângulo Vermelho)
+h_d2d_tx = plot(problem.pos_D2DTx(:,1), problem.pos_D2DTx(:,2), ...
+    '^r', 'MarkerSize',6, 'MarkerFaceColor','r', 'DisplayName','D2D Tx (Agente)');
+
+% Rx (Círculo Vermelho) - ADICIONADO
+h_d2d_rx = plot(problem.pos_D2DRx(:,1), problem.pos_D2DRx(:,2), ...
+    'or', 'MarkerSize',6, 'DisplayName','D2D Rx');
+
+% Linhas de conexão D2D (Opcional, visualmente polui se forem muitos)
+% for i=1:params.nD2D
+%    line([problem.pos_D2DTx(i,1) problem.pos_D2DRx(i,1)], ...
+%         [problem.pos_D2DTx(i,2) problem.pos_D2DRx(i,2)], 'Color', [1 0.6 0.6], 'HandleVisibility','off');
+% end
+
+% Cria a legenda apenas com os objetos principais
+legend([h_mbs, h_cue_c, h_cue_e, h_d2d_tx, h_d2d_rx], 'Location','bestoutside');
+
+hold off;
+
+% FIG 3: Matriz de Viabilidade
+figure(3); clf;
+imagesc(V_viabilidade);
+colormap(flipud(gray)); 
+title(sprintf('Fig 3: Matriz de Viabilidade (Fase 2) - Aprovados: %d/%d', ...
+    sum(any(V_viabilidade, 2)), params.nCUE+params.nD2D));
+xlabel('PRB Index'); ylabel('User Index (CUEs... D2Ds...)');
+
+% FIG 4: Convergência (Função Utilidade / Fitness)
+figure(4); clf; hold on;
+if exist('results','var')
+    plot(results.ABC.convFit, 'b-','LineWidth',1.5, 'DisplayName','ABC');
+    plot(results.OABC.convFit, 'm-','LineWidth',1.5, 'DisplayName','OABC');
+    if isfield(results, 'WOA'), plot(results.WOA.convFit, 'g-.','LineWidth',1.5, 'DisplayName','WOA'); end
+    xlabel('Iteração'); ylabel('Fitness (Com Penalidades)');
+    title('Fig 4: Convergência do Fitness (Busca pela Viabilidade)'); 
+    legend('show', 'Location', 'best'); grid on;
+end
+
+% FIG 5: Convergência (Função Objetivo / Throughput Real)
+figure(5); clf; hold on;
+if exist('results','var')
+    % Divide por 1e6 para plotar em Mbps
+    plot(results.ABC.convObj / 1e6, 'b-','LineWidth',1.5, 'DisplayName','ABC');
+    plot(results.OABC.convObj / 1e6, 'm-','LineWidth',1.5, 'DisplayName','OABC');
+    if isfield(results, 'WOA'), plot(results.WOA.convObj/1e6, 'g-.','LineWidth',1.5, 'DisplayName','WOA'); end
+    xlabel('Iteração'); ylabel('Throughput Total (Mbps)');
+    title('Fig 5: Função Objetivo (Throughput Real do Sistema)'); 
+    legend('show', 'Location', 'best'); grid on;
+end
+fprintf('Visualização Concluída.\n');
+toc;
